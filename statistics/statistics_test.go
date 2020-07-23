@@ -30,6 +30,7 @@ import (
 	"github.com/pingcap/tidb/types/json"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
+	"github.com/pingcap/tidb/util/collate"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/ranger"
 	"github.com/pingcap/tidb/util/sqlexec"
@@ -83,7 +84,7 @@ func (r *recordSet) getNext() []types.Datum {
 	return row
 }
 
-func (r *recordSet) Next(ctx context.Context, req *chunk.RecordBatch) error {
+func (r *recordSet) Next(ctx context.Context, req *chunk.Chunk) error {
 	req.Reset()
 	row := r.getNext()
 	if row != nil {
@@ -94,12 +95,12 @@ func (r *recordSet) Next(ctx context.Context, req *chunk.RecordBatch) error {
 	return nil
 }
 
-func (r *recordSet) NewRecordBatch() *chunk.RecordBatch {
+func (r *recordSet) NewChunk() *chunk.Chunk {
 	fields := make([]*types.FieldType, 0, len(r.fields))
 	for _, field := range r.fields {
 		fields = append(fields, &field.Column.FieldType)
 	}
-	return chunk.NewRecordBatch(chunk.NewChunkWithCapacity(fields, 32))
+	return chunk.NewChunkWithCapacity(fields, 32)
 }
 
 func (r *recordSet) Close() error {
@@ -177,7 +178,7 @@ func buildPK(sctx sessionctx.Context, numBuckets, id int64, records sqlexec.Reco
 	b := NewSortedBuilder(sctx.GetSessionVars().StmtCtx, numBuckets, id, types.NewFieldType(mysql.TypeLonglong))
 	ctx := context.Background()
 	for {
-		req := records.NewRecordBatch()
+		req := records.NewChunk()
 		err := records.Next(ctx, req)
 		if err != nil {
 			return 0, nil, errors.Trace(err)
@@ -185,7 +186,7 @@ func buildPK(sctx sessionctx.Context, numBuckets, id int64, records sqlexec.Reco
 		if req.NumRows() == 0 {
 			break
 		}
-		it := chunk.NewIterator4Chunk(req.Chunk)
+		it := chunk.NewIterator4Chunk(req)
 		for row := it.Begin(); row != it.End(); row = it.Next() {
 			datums := RowToDatums(row, records.Fields())
 			err = b.Iterate(datums[0])
@@ -201,8 +202,8 @@ func buildIndex(sctx sessionctx.Context, numBuckets, id int64, records sqlexec.R
 	b := NewSortedBuilder(sctx.GetSessionVars().StmtCtx, numBuckets, id, types.NewFieldType(mysql.TypeBlob))
 	cms := NewCMSketch(8, 2048)
 	ctx := context.Background()
-	req := records.NewRecordBatch()
-	it := chunk.NewIterator4Chunk(req.Chunk)
+	req := records.NewChunk()
+	it := chunk.NewIterator4Chunk(req)
 	for {
 		err := records.Next(ctx, req)
 		if err != nil {
@@ -238,7 +239,8 @@ func (s *testStatisticsSuite) TestBuild(c *C) {
 	bucketCount := int64(256)
 	ctx := mock.NewContext()
 	sc := ctx.GetSessionVars().StmtCtx
-	sketch, _, _ := buildFMSketch(sc, s.rc.(*recordSet).data, 1000)
+	sketch, _, err := buildFMSketch(sc, s.rc.(*recordSet).data, 1000)
+	c.Assert(err, IsNil)
 
 	collector := &SampleCollector{
 		Count:     int64(s.count),
@@ -276,8 +278,10 @@ func (s *testStatisticsSuite) TestBuild(c *C) {
 		ColLen:          1,
 		MaxSampleSize:   1000,
 		MaxFMSketchSize: 1000,
+		Collators:       make([]collate.Collator, 1),
+		ColsFieldType:   []*types.FieldType{types.NewFieldType(mysql.TypeLonglong)},
 	}
-	s.pk.Close()
+	c.Assert(s.pk.Close(), IsNil)
 	collectors, _, err := builder.CollectColumnStats()
 	c.Assert(err, IsNil)
 	c.Assert(len(collectors), Equals, 1)
@@ -286,7 +290,7 @@ func (s *testStatisticsSuite) TestBuild(c *C) {
 	checkRepeats(c, col)
 	c.Assert(col.Len(), Equals, 250)
 
-	tblCount, col, _, err := buildIndex(ctx, bucketCount, 1, sqlexec.RecordSet(s.rc))
+	tblCount, col, _, err := buildIndex(ctx, bucketCount, 1, s.rc)
 	c.Check(err, IsNil)
 	checkRepeats(c, col)
 	col.PreCalculateScalar()
@@ -303,7 +307,7 @@ func (s *testStatisticsSuite) TestBuild(c *C) {
 	c.Check(int(count), Equals, 0)
 
 	s.pk.(*recordSet).cursor = 0
-	tblCount, col, err = buildPK(ctx, bucketCount, 4, sqlexec.RecordSet(s.pk))
+	tblCount, col, err = buildPK(ctx, bucketCount, 4, s.pk)
 	c.Check(err, IsNil)
 	checkRepeats(c, col)
 	col.PreCalculateScalar()
@@ -336,8 +340,8 @@ func (s *testStatisticsSuite) TestBuild(c *C) {
 
 func (s *testStatisticsSuite) TestHistogramProtoConversion(c *C) {
 	ctx := mock.NewContext()
-	s.rc.Close()
-	tblCount, col, _, err := buildIndex(ctx, 256, 1, sqlexec.RecordSet(s.rc))
+	c.Assert(s.rc.Close(), IsNil)
+	tblCount, col, _, err := buildIndex(ctx, 256, 1, s.rc)
 	c.Check(err, IsNil)
 	c.Check(int(tblCount), Equals, 100000)
 
@@ -441,7 +445,8 @@ func (s *testStatisticsSuite) TestColumnRange(c *C) {
 	bucketCount := int64(256)
 	ctx := mock.NewContext()
 	sc := ctx.GetSessionVars().StmtCtx
-	sketch, _, _ := buildFMSketch(sc, s.rc.(*recordSet).data, 1000)
+	sketch, _, err := buildFMSketch(sc, s.rc.(*recordSet).data, 1000)
+	c.Assert(err, IsNil)
 
 	collector := &SampleCollector{
 		Count:     int64(s.count),

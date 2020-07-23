@@ -15,22 +15,16 @@ package executor
 
 import (
 	"context"
-	"fmt"
-	"strings"
 
 	"github.com/opentracing/opentracing-go"
-	"github.com/pingcap/parser"
 	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/tidb/bindinfo"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/config"
-	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/planner"
 	plannercore "github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/util/logutil"
-	"go.uber.org/zap"
 )
 
 var (
@@ -53,93 +47,75 @@ type Compiler struct {
 
 // Compile compiles an ast.StmtNode to a physical plan.
 func (c *Compiler) Compile(ctx context.Context, stmtNode ast.StmtNode) (*ExecStmt, error) {
-	return c.compile(ctx, stmtNode, false)
-}
-
-// SkipBindCompile compiles an ast.StmtNode to a physical plan without SQL bind.
-func (c *Compiler) SkipBindCompile(ctx context.Context, node ast.StmtNode) (*ExecStmt, error) {
-	return c.compile(ctx, node, true)
-}
-
-func (c *Compiler) compile(ctx context.Context, stmtNode ast.StmtNode, skipBind bool) (*ExecStmt, error) {
 	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
 		span1 := span.Tracer().StartSpan("executor.Compile", opentracing.ChildOf(span.Context()))
 		defer span1.Finish()
+		ctx = opentracing.ContextWithSpan(ctx, span1)
 	}
 
-	if !skipBind {
-		stmtNode = addHint(c.Ctx, stmtNode)
-	}
-
-	infoSchema := GetInfoSchema(c.Ctx)
+	infoSchema := infoschema.GetInfoSchema(c.Ctx)
 	if err := plannercore.Preprocess(c.Ctx, stmtNode, infoSchema); err != nil {
 		return nil, err
 	}
+	stmtNode = plannercore.TryAddExtraLimit(c.Ctx, stmtNode)
 
-	finalPlan, err := planner.Optimize(c.Ctx, stmtNode, infoSchema)
+	finalPlan, names, err := planner.Optimize(ctx, c.Ctx, stmtNode, infoSchema)
 	if err != nil {
 		return nil, err
 	}
 
 	CountStmtNode(stmtNode, c.Ctx.GetSessionVars().InRestrictedSQL)
-	isExpensive := logExpensiveQuery(stmtNode, finalPlan)
-
+	var lowerPriority bool
+	if c.Ctx.GetSessionVars().StmtCtx.Priority == mysql.NoPriority {
+		lowerPriority = needLowerPriority(finalPlan)
+	}
 	return &ExecStmt{
-		InfoSchema: infoSchema,
-		Plan:       finalPlan,
-		Expensive:  isExpensive,
-		Cacheable:  plannercore.Cacheable(stmtNode),
-		Text:       stmtNode.Text(),
-		StmtNode:   stmtNode,
-		Ctx:        c.Ctx,
+		GoCtx:         ctx,
+		InfoSchema:    infoSchema,
+		Plan:          finalPlan,
+		LowerPriority: lowerPriority,
+		Text:          stmtNode.Text(),
+		StmtNode:      stmtNode,
+		Ctx:           c.Ctx,
+		OutputNames:   names,
 	}, nil
 }
 
-func logExpensiveQuery(stmtNode ast.StmtNode, finalPlan plannercore.Plan) (expensive bool) {
-	expensive = isExpensiveQuery(finalPlan)
-	if !expensive {
-		return
-	}
-
-	const logSQLLen = 1024
-	sql := stmtNode.Text()
-	if len(sql) > logSQLLen {
-		sql = fmt.Sprintf("%s len(%d)", sql[:logSQLLen], len(sql))
-	}
-	logutil.Logger(context.Background()).Warn("EXPENSIVE_QUERY", zap.String("SQL", sql))
-	return
-}
-
-func isExpensiveQuery(p plannercore.Plan) bool {
+// needLowerPriority checks whether it's needed to lower the execution priority
+// of a query.
+// If the estimated output row count of any operator in the physical plan tree
+// is greater than the specific threshold, we'll set it to lowPriority when
+// sending it to the coprocessor.
+func needLowerPriority(p plannercore.Plan) bool {
 	switch x := p.(type) {
 	case plannercore.PhysicalPlan:
-		return isPhysicalPlanExpensive(x)
+		return isPhysicalPlanNeedLowerPriority(x)
 	case *plannercore.Execute:
-		return isExpensiveQuery(x.Plan)
+		return needLowerPriority(x.Plan)
 	case *plannercore.Insert:
 		if x.SelectPlan != nil {
-			return isPhysicalPlanExpensive(x.SelectPlan)
+			return isPhysicalPlanNeedLowerPriority(x.SelectPlan)
 		}
 	case *plannercore.Delete:
 		if x.SelectPlan != nil {
-			return isPhysicalPlanExpensive(x.SelectPlan)
+			return isPhysicalPlanNeedLowerPriority(x.SelectPlan)
 		}
 	case *plannercore.Update:
 		if x.SelectPlan != nil {
-			return isPhysicalPlanExpensive(x.SelectPlan)
+			return isPhysicalPlanNeedLowerPriority(x.SelectPlan)
 		}
 	}
 	return false
 }
 
-func isPhysicalPlanExpensive(p plannercore.PhysicalPlan) bool {
-	expensiveRowThreshold := int64(config.GetGlobalConfig().Log.ExpensiveThreshold)
-	if int64(p.StatsCount()) > expensiveRowThreshold {
+func isPhysicalPlanNeedLowerPriority(p plannercore.PhysicalPlan) bool {
+	expensiveThreshold := int64(config.GetGlobalConfig().Log.ExpensiveThreshold)
+	if int64(p.StatsCount()) > expensiveThreshold {
 		return true
 	}
 
 	for _, child := range p.Children() {
-		if isPhysicalPlanExpensive(child) {
+		if isPhysicalPlanNeedLowerPriority(child) {
 			return true
 		}
 	}
@@ -282,18 +258,14 @@ func getDbFromResultNode(resultNode ast.ResultSetNode) []string { //may have dup
 		if x.Left != nil {
 			dbs := getDbFromResultNode(x.Left)
 			if dbs != nil {
-				for _, db := range dbs {
-					dbLabels = append(dbLabels, db)
-				}
+				dbLabels = append(dbLabels, dbs...)
 			}
 		}
 
 		if x.Right != nil {
 			dbs := getDbFromResultNode(x.Right)
 			if dbs != nil {
-				for _, db := range dbs {
-					dbLabels = append(dbLabels, db)
-				}
+				dbLabels = append(dbLabels, dbs...)
 			}
 		}
 	}
@@ -367,65 +339,8 @@ func GetStmtLabel(stmtNode ast.StmtNode) string {
 		return "Use"
 	case *ast.CreateBindingStmt:
 		return "CreateBinding"
+	case *ast.IndexAdviseStmt:
+		return "IndexAdvise"
 	}
 	return "other"
-}
-
-// GetInfoSchema gets TxnCtx InfoSchema if snapshot schema is not set,
-// Otherwise, snapshot schema is returned.
-func GetInfoSchema(ctx sessionctx.Context) infoschema.InfoSchema {
-	sessVar := ctx.GetSessionVars()
-	var is infoschema.InfoSchema
-	if snap := sessVar.SnapshotInfoschema; snap != nil {
-		is = snap.(infoschema.InfoSchema)
-		logutil.Logger(context.Background()).Info("use snapshot schema", zap.Uint64("conn", sessVar.ConnectionID), zap.Int64("schemaVersion", is.SchemaMetaVersion()))
-	} else {
-		is = sessVar.TxnCtx.InfoSchema.(infoschema.InfoSchema)
-	}
-	return is
-}
-
-func addHint(ctx sessionctx.Context, stmtNode ast.StmtNode) ast.StmtNode {
-	if ctx.Value(bindinfo.SessionBindInfoKeyType) == nil { //when the domain is initializing, the bind will be nil.
-		return stmtNode
-	}
-	switch x := stmtNode.(type) {
-	case *ast.ExplainStmt:
-		switch x.Stmt.(type) {
-		case *ast.SelectStmt:
-			normalizeExplainSQL := parser.Normalize(x.Text())
-			idx := strings.Index(normalizeExplainSQL, "select")
-			normalizeSQL := normalizeExplainSQL[idx:]
-			hash := parser.DigestHash(normalizeSQL)
-			x.Stmt = addHintForSelect(hash, normalizeSQL, ctx, x.Stmt)
-		}
-		return x
-	case *ast.SelectStmt:
-		normalizeSQL, hash := parser.NormalizeDigest(x.Text())
-		return addHintForSelect(hash, normalizeSQL, ctx, x)
-	default:
-		return stmtNode
-	}
-}
-
-func addHintForSelect(hash, normdOrigSQL string, ctx sessionctx.Context, stmt ast.StmtNode) ast.StmtNode {
-	sessionHandle := ctx.Value(bindinfo.SessionBindInfoKeyType).(*bindinfo.SessionHandle)
-	bindRecord := sessionHandle.GetBindRecord(normdOrigSQL, ctx.GetSessionVars().CurrentDB)
-	if bindRecord != nil {
-		if bindRecord.Status == bindinfo.Invalid {
-			return stmt
-		}
-		if bindRecord.Status == bindinfo.Using {
-			return bindinfo.BindHint(stmt, bindRecord.Ast)
-		}
-	}
-	globalHandle := domain.GetDomain(ctx).BindHandle()
-	bindRecord = globalHandle.GetBindRecord(hash, normdOrigSQL, ctx.GetSessionVars().CurrentDB)
-	if bindRecord == nil {
-		bindRecord = globalHandle.GetBindRecord(hash, normdOrigSQL, "")
-	}
-	if bindRecord != nil {
-		return bindinfo.BindHint(stmt, bindRecord.Ast)
-	}
-	return stmt
 }

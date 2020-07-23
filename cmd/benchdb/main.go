@@ -48,9 +48,6 @@ var (
 		"gc",
 		"select:0_10000:10",
 	}, "|"), "jobs to run")
-	sslCA   = flag.String("cacert", "", "path of file that contains list of trusted SSL CAs.")
-	sslCert = flag.String("cert", "", "path of file that contains X509 certificate in PEM format.")
-	sslKey  = flag.String("key", "", "path of file that contains X509 key in PEM format.")
 )
 
 func main() {
@@ -117,7 +114,7 @@ func (ut *benchDB) mustExec(sql string) {
 	if len(rss) > 0 {
 		ctx := context.Background()
 		rs := rss[0]
-		req := rs.NewRecordBatch()
+		req := rs.NewChunk()
 		for {
 			err := rs.Next(ctx, req)
 			if err != nil {

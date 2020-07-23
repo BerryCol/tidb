@@ -37,14 +37,14 @@ func validInterval(sc *stmtctx.StatementContext, low, high point) (bool, error) 
 		return false, errors.Trace(err)
 	}
 	if low.excl {
-		l = []byte(kv.Key(l).PrefixNext())
+		l = kv.Key(l).PrefixNext()
 	}
 	r, err := codec.EncodeKey(sc, nil, high.value)
 	if err != nil {
 		return false, errors.Trace(err)
 	}
 	if !high.excl {
-		r = []byte(kv.Key(r).PrefixNext())
+		r = kv.Key(r).PrefixNext()
 	}
 	return bytes.Compare(l, r) < 0, nil
 }
@@ -263,12 +263,16 @@ func buildColumnRange(accessConditions []expression.Expression, sc *stmtctx.Stat
 	}
 	if colLen != types.UnspecifiedLength {
 		for _, ran := range ranges {
-			if fixRangeDatum(&ran.LowVal[0], colLen, tp) {
+			if CutDatumByPrefixLen(&ran.LowVal[0], colLen, tp) {
 				ran.LowExclude = false
 			}
-			if fixRangeDatum(&ran.HighVal[0], colLen, tp) {
+			if CutDatumByPrefixLen(&ran.HighVal[0], colLen, tp) {
 				ran.HighExclude = false
 			}
+		}
+		ranges, err = UnionRanges(sc, ranges)
+		if err != nil {
+			return nil, err
 		}
 	}
 	return ranges, nil
@@ -299,9 +303,6 @@ func buildCNFIndexRange(sc *stmtctx.StatementContext, cols []*expression.Column,
 		newTp = append(newTp, newFieldType(col.RetType))
 	}
 	for i := 0; i < eqAndInCount; i++ {
-		if sf, ok := accessCondition[i].(*expression.ScalarFunction); !ok || (sf.FuncName.L != ast.EQ && sf.FuncName.L != ast.In) {
-			break
-		}
 		// Build ranges for equal or in access conditions.
 		point := rb.build(accessCondition[i])
 		if rb.err != nil {
@@ -336,7 +337,7 @@ func buildCNFIndexRange(sc *stmtctx.StatementContext, cols []*expression.Column,
 	// Take prefix index into consideration.
 	if hasPrefix(lengths) {
 		if fixPrefixColRange(ranges, lengths, newTp) {
-			ranges, err = unionRanges(sc, ranges)
+			ranges, err = UnionRanges(sc, ranges)
 			if err != nil {
 				return nil, errors.Trace(err)
 			}
@@ -352,7 +353,11 @@ type sortRange struct {
 	encodedEnd    []byte
 }
 
-func unionRanges(sc *stmtctx.StatementContext, ranges []*Range) ([]*Range, error) {
+// UnionRanges sorts `ranges`, union adjacent ones if possible.
+// For two intervals [a, b], [c, d], we have guaranteed that a <= c. If b >= c. Then two intervals are overlapped.
+// And this two can be merged as [a, max(b, d)].
+// Otherwise they aren't overlapped.
+func UnionRanges(sc *stmtctx.StatementContext, ranges []*Range) ([]*Range, error) {
 	if len(ranges) == 0 {
 		return nil, nil
 	}
@@ -380,9 +385,6 @@ func unionRanges(sc *stmtctx.StatementContext, ranges []*Range) ([]*Range, error
 	ranges = ranges[:0]
 	lastRange := objects[0]
 	for i := 1; i < len(objects); i++ {
-		// For two intervals [a, b], [c, d], we have guaranteed that a >= c. If b >= c. Then two intervals are overlapped.
-		// And this two can be merged as [a, max(b, d)].
-		// Otherwise they aren't overlapped.
 		if bytes.Compare(lastRange.encodedEnd, objects[i].encodedStart) >= 0 {
 			if bytes.Compare(lastRange.encodedEnd, objects[i].encodedEnd) < 0 {
 				lastRange.encodedEnd = objects[i].encodedEnd
@@ -425,17 +427,17 @@ func fixPrefixColRange(ranges []*Range, lengths []int, tp []*types.FieldType) bo
 	for _, ran := range ranges {
 		lowTail := len(ran.LowVal) - 1
 		for i := 0; i < lowTail; i++ {
-			fixRangeDatum(&ran.LowVal[i], lengths[i], tp[i])
+			CutDatumByPrefixLen(&ran.LowVal[i], lengths[i], tp[i])
 		}
-		lowCut := fixRangeDatum(&ran.LowVal[lowTail], lengths[lowTail], tp[lowTail])
+		lowCut := CutDatumByPrefixLen(&ran.LowVal[lowTail], lengths[lowTail], tp[lowTail])
 		if lowCut {
 			ran.LowExclude = false
 		}
 		highTail := len(ran.HighVal) - 1
 		for i := 0; i < highTail; i++ {
-			fixRangeDatum(&ran.HighVal[i], lengths[i], tp[i])
+			CutDatumByPrefixLen(&ran.HighVal[i], lengths[i], tp[i])
 		}
-		highCut := fixRangeDatum(&ran.HighVal[highTail], lengths[highTail], tp[highTail])
+		highCut := CutDatumByPrefixLen(&ran.HighVal[highTail], lengths[highTail], tp[highTail])
 		if highCut {
 			ran.HighExclude = false
 		}
@@ -444,9 +446,9 @@ func fixPrefixColRange(ranges []*Range, lengths []int, tp []*types.FieldType) bo
 	return hasCut
 }
 
-func fixRangeDatum(v *types.Datum, length int, tp *types.FieldType) bool {
-	// If this column is prefix and the prefix length is smaller than the range, cut it.
-	// In case of UTF8, prefix should be cut by characters rather than bytes
+// CutDatumByPrefixLen cuts the datum according to the prefix length.
+// If it's UTF8 encoded, we will cut it by characters rather than bytes.
+func CutDatumByPrefixLen(v *types.Datum, length int, tp *types.FieldType) bool {
 	if v.Kind() == types.KindString || v.Kind() == types.KindBytes {
 		colCharset := tp.Charset
 		colValue := v.GetBytes()
@@ -456,12 +458,15 @@ func fixRangeDatum(v *types.Datum, length int, tp *types.FieldType) bool {
 				rs := bytes.Runes(colValue)
 				truncateStr := string(rs[:length])
 				// truncate value and limit its length
-				v.SetString(truncateStr)
+				v.SetString(truncateStr, tp.Collate)
 				return true
 			}
 		} else if length != types.UnspecifiedLength && len(colValue) > length {
 			// truncate value and limit its length
 			v.SetBytes(colValue[:length])
+			if v.Kind() == types.KindString {
+				v.SetString(v.GetString(), tp.Collate)
+			}
 			return true
 		}
 	}
@@ -481,7 +486,7 @@ func newFieldType(tp *types.FieldType) *types.FieldType {
 	// To avoid data truncate error.
 	case mysql.TypeFloat, mysql.TypeDouble, mysql.TypeBlob, mysql.TypeTinyBlob, mysql.TypeMediumBlob, mysql.TypeLongBlob,
 		mysql.TypeString, mysql.TypeVarchar, mysql.TypeVarString:
-		newTp := types.NewFieldType(tp.Tp)
+		newTp := types.NewFieldTypeWithCollation(tp.Tp, tp.Collate, types.UnspecifiedLength)
 		newTp.Charset = tp.Charset
 		return newTp
 	default:
@@ -520,6 +525,5 @@ func points2EqOrInCond(ctx sessionctx.Context, points []point, expr expression.E
 	if len(args) > 2 {
 		funcName = ast.In
 	}
-	f := expression.NewFunctionInternal(ctx, funcName, sf.GetType(), args...)
-	return f
+	return expression.NewFunctionInternal(ctx, funcName, sf.GetType(), args...)
 }

@@ -57,7 +57,7 @@ type testKVSuite struct {
 
 func (s *testKVSuite) SetUpSuite(c *C) {
 	testleak.BeforeTest()
-	store, err := mockstore.NewMockTikvStore()
+	store, err := mockstore.NewMockStore()
 	c.Assert(err, IsNil)
 	s.s = store
 }
@@ -147,7 +147,7 @@ func checkSeek(c *C, txn kv.Transaction) {
 func mustNotGet(c *C, txn kv.Transaction) {
 	for i := startIndex; i < testCount; i++ {
 		s := encodeInt(i * indexStep)
-		_, err := txn.Get(s)
+		_, err := txn.Get(context.TODO(), s)
 		c.Assert(err, NotNil)
 	}
 }
@@ -155,10 +155,16 @@ func mustNotGet(c *C, txn kv.Transaction) {
 func mustGet(c *C, txn kv.Transaction) {
 	for i := startIndex; i < testCount; i++ {
 		s := encodeInt(i * indexStep)
-		val, err := txn.Get(s)
+		val, err := txn.Get(context.TODO(), s)
 		c.Assert(err, IsNil)
 		c.Assert(string(val), Equals, string(s))
 	}
+}
+
+func (s *testKVSuite) TestNew(c *C) {
+	store, err := New("goleveldb://relative/path")
+	c.Assert(err, NotNil)
+	c.Assert(store, IsNil)
 }
 
 func (s *testKVSuite) TestGetSet(c *C) {
@@ -291,7 +297,7 @@ func (s *testKVSuite) TestDelete2(c *C) {
 	it, err := txn.Iter([]byte("DATA_test_tbl_department_record__0000000001_0003"), nil)
 	c.Assert(err, IsNil)
 	for it.Valid() {
-		err = txn.Delete([]byte(it.Key()))
+		err = txn.Delete(it.Key())
 		c.Assert(err, IsNil)
 		err = it.Next()
 		c.Assert(err, IsNil)
@@ -401,7 +407,7 @@ func (s *testKVSuite) TestRollback(c *C) {
 	defer txn.Commit(context.Background())
 
 	for i := startIndex; i < testCount; i++ {
-		_, err := txn.Get([]byte(strconv.Itoa(i)))
+		_, err := txn.Get(context.TODO(), []byte(strconv.Itoa(i)))
 		c.Assert(err, NotNil)
 	}
 }
@@ -428,7 +434,6 @@ func (s *testKVSuite) TestSeekMin(c *C) {
 	it, err := txn.Iter(nil, nil)
 	c.Assert(err, IsNil)
 	for it.Valid() {
-		fmt.Printf("%s, %s\n", it.Key(), it.Value())
 		it.Next()
 	}
 
@@ -525,7 +530,7 @@ func (s *testKVSuite) TestConditionUpdate(c *C) {
 
 func (s *testKVSuite) TestDBClose(c *C) {
 	c.Skip("don't know why it fails.")
-	store, err := mockstore.NewMockTikvStore()
+	store, err := mockstore.NewMockStore()
 	c.Assert(err, IsNil)
 
 	txn, err := store.Begin()
@@ -544,7 +549,7 @@ func (s *testKVSuite) TestDBClose(c *C) {
 	snap, err := store.GetSnapshot(kv.MaxVersion)
 	c.Assert(err, IsNil)
 
-	_, err = snap.Get([]byte("a"))
+	_, err = snap.Get(context.TODO(), []byte("a"))
 	c.Assert(err, IsNil)
 
 	txn, err = store.Begin()
@@ -640,7 +645,7 @@ func (s *testKVSuite) TestIsolationMultiInc(c *C) {
 
 	err := kv.RunInNewTxn(s.s, false, func(txn kv.Transaction) error {
 		for _, key := range keys {
-			id, err1 := kv.GetInt64(txn, key)
+			id, err1 := kv.GetInt64(context.TODO(), txn, key)
 			if err1 != nil {
 				return err1
 			}
@@ -662,4 +667,20 @@ func (s *testKVSuite) TestRetryOpenStore(c *C) {
 	c.Assert(err, NotNil)
 	elapse := time.Since(begin)
 	c.Assert(uint64(elapse), GreaterEqual, uint64(3*time.Second), Commentf("elapse: %s", elapse))
+}
+
+func (s *testKVSuite) TestOpenStore(c *C) {
+	Register("open", &brokenStore{})
+	store, err := newStoreWithRetry(":", 3)
+	if store != nil {
+		defer store.Close()
+	}
+	c.Assert(err, NotNil)
+}
+
+func (s *testKVSuite) TestRegister(c *C) {
+	err := Register("retry", &brokenStore{})
+	c.Assert(err, IsNil)
+	err = Register("retry", &brokenStore{})
+	c.Assert(err, NotNil)
 }

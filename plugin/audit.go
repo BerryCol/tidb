@@ -16,7 +16,6 @@ package plugin
 import (
 	"context"
 
-	"github.com/pingcap/parser/auth"
 	"github.com/pingcap/tidb/sessionctx/variable"
 )
 
@@ -46,6 +45,8 @@ const (
 	ChangeUser
 	// PreAuth presents event before start auth.
 	PreAuth
+	// Reject presents event reject connection event.
+	Reject
 )
 
 func (c ConnectionEvent) String() string {
@@ -58,6 +59,8 @@ func (c ConnectionEvent) String() string {
 		return "ChangeUser"
 	case PreAuth:
 		return "PreAuth"
+	case Reject:
+		return "Reject"
 	}
 	return ""
 }
@@ -77,7 +80,7 @@ type AuditManifest struct {
 	Manifest
 	// OnConnectionEvent will be called when TiDB receive or disconnect from client.
 	// return error will ignore and close current connection.
-	OnConnectionEvent func(ctx context.Context, identity *auth.UserIdentity, event ConnectionEvent, info *variable.ConnectionInfo) error
+	OnConnectionEvent func(ctx context.Context, event ConnectionEvent, info *variable.ConnectionInfo) error
 	// OnGeneralEvent will be called during TiDB execution.
 	OnGeneralEvent func(ctx context.Context, sctx *variable.SessionVars, event GeneralEvent, cmd string)
 	// OnGlobalVariableEvent will be called when Change GlobalVariable.
@@ -85,3 +88,13 @@ type AuditManifest struct {
 	// OnParseEvent will be called around parse logic.
 	OnParseEvent func(ctx context.Context, sctx *variable.SessionVars, event ParseEvent) error
 }
+
+type (
+	// RejectReasonCtxValue will be used in OnConnectionEvent to pass RejectReason to plugin.
+	RejectReasonCtxValue struct{}
+)
+
+type execStartTimeCtxKeyType struct{}
+
+// ExecStartTimeCtxKey indicates stmt start execution time.
+var ExecStartTimeCtxKey = execStartTimeCtxKeyType{}

@@ -16,15 +16,18 @@ package executor
 import (
 	"container/heap"
 	"context"
+	"errors"
 	"fmt"
 	"sort"
-	"time"
 
-	"github.com/opentracing/opentracing-go"
+	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/expression"
 	plannercore "github.com/pingcap/tidb/planner/core"
+	"github.com/pingcap/tidb/planner/util"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/disk"
 	"github.com/pingcap/tidb/util/memory"
 	"github.com/pingcap/tidb/util/stringutil"
 )
@@ -35,7 +38,7 @@ var rowChunksLabel fmt.Stringer = stringutil.StringerStr("rowChunks")
 type SortExec struct {
 	baseExecutor
 
-	ByItems []*plannercore.ByItems
+	ByItems []*util.ByItems
 	Idx     int
 	fetched bool
 	schema  *expression.Schema
@@ -47,17 +50,39 @@ type SortExec struct {
 	// keyCmpFuncs is used to compare each ByItem.
 	keyCmpFuncs []chunk.CompareFunc
 	// rowChunks is the chunks to store row values.
-	rowChunks *chunk.List
-	// rowPointer store the chunk index and row index for each row.
-	rowPtrs []chunk.RowPtr
+	rowChunks *chunk.SortedRowContainer
 
-	memTracker *memory.Tracker
+	memTracker  *memory.Tracker
+	diskTracker *disk.Tracker
+
+	// partitionList is the chunks to store row values for partitions. Every partition is a sorted list.
+	partitionList []*chunk.SortedRowContainer
+
+	// multiWayMerge uses multi-way merge for spill disk.
+	// The multi-way merge algorithm can refer to https://en.wikipedia.org/wiki/K-way_merge_algorithm
+	multiWayMerge *multiWayMerge
+	// spillAction save the Action for spill disk.
+	spillAction *chunk.SortAndSpillDiskAction
 }
 
 // Close implements the Executor Close interface.
 func (e *SortExec) Close() error {
-	e.memTracker.Detach()
+	for _, container := range e.partitionList {
+		err := container.Close()
+		if err != nil {
+			return err
+		}
+	}
+	e.partitionList = e.partitionList[:0]
+
+	if e.rowChunks != nil {
+		e.memTracker.Consume(-e.rowChunks.GetMemTracker().BytesConsumed())
+		e.rowChunks = nil
+	}
 	e.memTracker = nil
+	e.diskTracker = nil
+	e.multiWayMerge = nil
+	e.spillAction = nil
 	return e.children[0].Close()
 }
 
@@ -68,50 +93,145 @@ func (e *SortExec) Open(ctx context.Context) error {
 
 	// To avoid duplicated initialization for TopNExec.
 	if e.memTracker == nil {
-		e.memTracker = memory.NewTracker(e.id, e.ctx.GetSessionVars().MemQuotaSort)
+		e.memTracker = memory.NewTracker(e.id, -1)
 		e.memTracker.AttachTo(e.ctx.GetSessionVars().StmtCtx.MemTracker)
+		e.diskTracker = memory.NewTracker(e.id, -1)
+		e.diskTracker.AttachTo(e.ctx.GetSessionVars().StmtCtx.DiskTracker)
 	}
+	e.partitionList = e.partitionList[:0]
 	return e.children[0].Open(ctx)
 }
 
 // Next implements the Executor Next interface.
-func (e *SortExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
-	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
-		span1 := span.Tracer().StartSpan("sort.Next", opentracing.ChildOf(span.Context()))
-		defer span1.Finish()
-	}
-	if e.runtimeStats != nil {
-		start := time.Now()
-		defer func() { e.runtimeStats.Record(time.Since(start), req.NumRows()) }()
-	}
+// Sort constructs the result following these step:
+// 1. Read as mush as rows into memory.
+// 2. If memory quota is triggered, sort these rows in memory and put them into disk as partition 1, then reset
+//    the memory quota trigger and return to step 1
+// 3. If memory quota is not triggered and child is consumed, sort these rows in memory as partition N.
+// 4. Merge sort if the count of partitions is larger than 1. If there is only one partition in step 4, it works
+//    just like in-memory sort before.
+func (e *SortExec) Next(ctx context.Context, req *chunk.Chunk) error {
 	req.Reset()
 	if !e.fetched {
+		e.initCompareFuncs()
+		e.buildKeyColumns()
 		err := e.fetchRowChunks(ctx)
 		if err != nil {
 			return err
 		}
-		e.initPointers()
-		e.initCompareFuncs()
-		e.buildKeyColumns()
-		sort.Slice(e.rowPtrs, e.keyColumnsLess)
 		e.fetched = true
 	}
-	for !req.IsFull() && e.Idx < len(e.rowPtrs) {
-		rowPtr := e.rowPtrs[e.Idx]
-		req.AppendRow(e.rowChunks.GetRow(rowPtr))
-		e.Idx++
+
+	if len(e.partitionList) == 0 {
+		return nil
+	}
+	if len(e.partitionList) > 1 {
+		if err := e.externalSorting(req); err != nil {
+			return err
+		}
+	} else {
+		for !req.IsFull() && e.Idx < e.partitionList[0].NumRow() {
+			row, err := e.partitionList[0].GetSortedRow(e.Idx)
+			if err != nil {
+				return err
+			}
+			req.AppendRow(row)
+			e.Idx++
+		}
+	}
+	return nil
+}
+
+type partitionPointer struct {
+	row         chunk.Row
+	partitionID int
+	consumed    int
+}
+
+type multiWayMerge struct {
+	lessRowFunction func(rowI chunk.Row, rowJ chunk.Row) bool
+	elements        []partitionPointer
+}
+
+func (h *multiWayMerge) Less(i, j int) bool {
+	rowI := h.elements[i].row
+	rowJ := h.elements[j].row
+	return h.lessRowFunction(rowI, rowJ)
+}
+
+func (h *multiWayMerge) Len() int {
+	return len(h.elements)
+}
+
+func (h *multiWayMerge) Push(x interface{}) {
+	// Should never be called.
+}
+
+func (h *multiWayMerge) Pop() interface{} {
+	h.elements = h.elements[:len(h.elements)-1]
+	return nil
+}
+
+func (h *multiWayMerge) Swap(i, j int) {
+	h.elements[i], h.elements[j] = h.elements[j], h.elements[i]
+}
+
+func (e *SortExec) externalSorting(req *chunk.Chunk) (err error) {
+	if e.multiWayMerge == nil {
+		e.multiWayMerge = &multiWayMerge{e.lessRow, make([]partitionPointer, 0, len(e.partitionList))}
+		for i := 0; i < len(e.partitionList); i++ {
+			row, err := e.partitionList[i].GetSortedRow(0)
+			if err != nil {
+				return err
+			}
+			e.multiWayMerge.elements = append(e.multiWayMerge.elements, partitionPointer{row: row, partitionID: i, consumed: 0})
+		}
+		heap.Init(e.multiWayMerge)
+	}
+
+	for !req.IsFull() && e.multiWayMerge.Len() > 0 {
+		partitionPtr := e.multiWayMerge.elements[0]
+		req.AppendRow(partitionPtr.row)
+		partitionPtr.consumed++
+		if partitionPtr.consumed >= e.partitionList[partitionPtr.partitionID].NumRow() {
+			heap.Remove(e.multiWayMerge, 0)
+			continue
+		}
+		partitionPtr.row, err = e.partitionList[partitionPtr.partitionID].
+			GetSortedRow(partitionPtr.consumed)
+		if err != nil {
+			return err
+		}
+		e.multiWayMerge.elements[0] = partitionPtr
+		heap.Fix(e.multiWayMerge, 0)
 	}
 	return nil
 }
 
 func (e *SortExec) fetchRowChunks(ctx context.Context) error {
-	fields := e.retTypes()
-	e.rowChunks = chunk.NewList(fields, e.initCap, e.maxChunkSize)
+	fields := retTypes(e)
+	byItemsDesc := make([]bool, len(e.ByItems))
+	for i, byItem := range e.ByItems {
+		byItemsDesc[i] = byItem.Desc
+	}
+	e.rowChunks = chunk.NewSortedRowContainer(fields, e.maxChunkSize, byItemsDesc, e.keyColumns, e.keyCmpFuncs)
 	e.rowChunks.GetMemTracker().AttachTo(e.memTracker)
 	e.rowChunks.GetMemTracker().SetLabel(rowChunksLabel)
+	if config.GetGlobalConfig().OOMUseTmpStorage {
+		e.spillAction = e.rowChunks.ActionSpill()
+		failpoint.Inject("testSortedRowContainerSpill", func(val failpoint.Value) {
+			if val.(bool) {
+				e.spillAction = e.rowChunks.ActionSpillForTest()
+				defer e.spillAction.WaitForTest()
+			}
+		})
+		e.ctx.GetSessionVars().StmtCtx.MemTracker.FallbackOldAndSetNewAction(e.spillAction)
+		e.rowChunks.GetDiskTracker().AttachTo(e.diskTracker)
+		e.rowChunks.GetDiskTracker().SetLabel(rowChunksLabel)
+	}
 	for {
-		chk := e.children[0].newFirstChunk()
-		err := e.children[0].Next(ctx, chunk.NewRecordBatch(chk))
+		chk := newFirstChunk(e.children[0])
+		err := Next(ctx, e.children[0], chk)
 		if err != nil {
 			return err
 		}
@@ -119,20 +239,27 @@ func (e *SortExec) fetchRowChunks(ctx context.Context) error {
 		if rowCount == 0 {
 			break
 		}
-		e.rowChunks.Add(chk)
-	}
-	return nil
-}
-
-func (e *SortExec) initPointers() {
-	e.rowPtrs = make([]chunk.RowPtr, 0, e.rowChunks.Len())
-	e.memTracker.Consume(int64(8 * e.rowChunks.Len()))
-	for chkIdx := 0; chkIdx < e.rowChunks.NumChunks(); chkIdx++ {
-		rowChk := e.rowChunks.GetChunk(chkIdx)
-		for rowIdx := 0; rowIdx < rowChk.NumRows(); rowIdx++ {
-			e.rowPtrs = append(e.rowPtrs, chunk.RowPtr{ChkIdx: uint32(chkIdx), RowIdx: uint32(rowIdx)})
+		if err := e.rowChunks.Add(chk); err != nil {
+			if errors.Is(err, chunk.ErrCannotAddBecauseSorted) {
+				e.partitionList = append(e.partitionList, e.rowChunks)
+				e.rowChunks = chunk.NewSortedRowContainer(fields, e.maxChunkSize, byItemsDesc, e.keyColumns, e.keyCmpFuncs)
+				e.rowChunks.GetMemTracker().AttachTo(e.memTracker)
+				e.rowChunks.GetMemTracker().SetLabel(rowChunksLabel)
+				e.rowChunks.GetDiskTracker().AttachTo(e.diskTracker)
+				e.rowChunks.GetDiskTracker().SetLabel(rowChunksLabel)
+				e.spillAction.ResetRowContainer(e.rowChunks)
+				err = e.rowChunks.Add(chk)
+			}
+			if err != nil {
+				return err
+			}
 		}
 	}
+	if e.rowChunks.NumRow() > 0 {
+		e.rowChunks.Sort()
+		e.partitionList = append(e.partitionList, e.rowChunks)
+	}
+	return nil
 }
 
 func (e *SortExec) initCompareFuncs() {
@@ -167,19 +294,17 @@ func (e *SortExec) lessRow(rowI, rowJ chunk.Row) bool {
 	return false
 }
 
-// keyColumnsLess is the less function for key columns.
-func (e *SortExec) keyColumnsLess(i, j int) bool {
-	rowI := e.rowChunks.GetRow(e.rowPtrs[i])
-	rowJ := e.rowChunks.GetRow(e.rowPtrs[j])
-	return e.lessRow(rowI, rowJ)
-}
-
 // TopNExec implements a Top-N algorithm and it is built from a SELECT statement with ORDER BY and LIMIT.
 // Instead of sorting all the rows fetched from the table, it keeps the Top-N elements only in a heap to reduce memory usage.
 type TopNExec struct {
 	SortExec
 	limit      *plannercore.PhysicalLimit
 	totalLimit uint64
+
+	// rowChunks is the chunks to store row values.
+	rowChunks *chunk.List
+	// rowPointer store the chunk index and row index for each row.
+	rowPtrs []chunk.RowPtr
 
 	chkHeap *topNChunkHeap
 }
@@ -231,23 +356,37 @@ func (h *topNChunkHeap) Swap(i, j int) {
 	h.rowPtrs[i], h.rowPtrs[j] = h.rowPtrs[j], h.rowPtrs[i]
 }
 
+// keyColumnsLess is the less function for key columns.
+func (e *TopNExec) keyColumnsLess(i, j int) bool {
+	rowI := e.rowChunks.GetRow(e.rowPtrs[i])
+	rowJ := e.rowChunks.GetRow(e.rowPtrs[j])
+	return e.lessRow(rowI, rowJ)
+}
+
+func (e *TopNExec) initPointers() {
+	e.rowPtrs = make([]chunk.RowPtr, 0, e.rowChunks.Len())
+	e.memTracker.Consume(int64(8 * e.rowChunks.Len()))
+	for chkIdx := 0; chkIdx < e.rowChunks.NumChunks(); chkIdx++ {
+		rowChk := e.rowChunks.GetChunk(chkIdx)
+		for rowIdx := 0; rowIdx < rowChk.NumRows(); rowIdx++ {
+			e.rowPtrs = append(e.rowPtrs, chunk.RowPtr{ChkIdx: uint32(chkIdx), RowIdx: uint32(rowIdx)})
+		}
+	}
+}
+
 // Open implements the Executor Open interface.
 func (e *TopNExec) Open(ctx context.Context) error {
-	e.memTracker = memory.NewTracker(e.id, e.ctx.GetSessionVars().MemQuotaTopn)
+	e.memTracker = memory.NewTracker(e.id, -1)
 	e.memTracker.AttachTo(e.ctx.GetSessionVars().StmtCtx.MemTracker)
-	return e.SortExec.Open(ctx)
+
+	e.fetched = false
+	e.Idx = 0
+
+	return e.children[0].Open(ctx)
 }
 
 // Next implements the Executor Next interface.
-func (e *TopNExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
-	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
-		span1 := span.Tracer().StartSpan("topN.Next", opentracing.ChildOf(span.Context()))
-		defer span1.Finish()
-	}
-	if e.runtimeStats != nil {
-		start := time.Now()
-		defer func() { e.runtimeStats.Record(time.Since(start), req.NumRows()) }()
-	}
+func (e *TopNExec) Next(ctx context.Context, req *chunk.Chunk) error {
 	req.Reset()
 	if !e.fetched {
 		e.totalLimit = e.limit.Offset + e.limit.Count
@@ -275,14 +414,14 @@ func (e *TopNExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
 
 func (e *TopNExec) loadChunksUntilTotalLimit(ctx context.Context) error {
 	e.chkHeap = &topNChunkHeap{e}
-	e.rowChunks = chunk.NewList(e.retTypes(), e.initCap, e.maxChunkSize)
+	e.rowChunks = chunk.NewList(retTypes(e), e.initCap, e.maxChunkSize)
 	e.rowChunks.GetMemTracker().AttachTo(e.memTracker)
 	e.rowChunks.GetMemTracker().SetLabel(rowChunksLabel)
 	for uint64(e.rowChunks.Len()) < e.totalLimit {
-		srcChk := e.children[0].newFirstChunk()
+		srcChk := newFirstChunk(e.children[0])
 		// adjust required rows by total limit
 		srcChk.SetRequiredRows(int(e.totalLimit-uint64(e.rowChunks.Len())), e.maxChunkSize)
-		err := e.children[0].Next(ctx, chunk.NewRecordBatch(srcChk))
+		err := Next(ctx, e.children[0], srcChk)
 		if err != nil {
 			return err
 		}
@@ -305,9 +444,9 @@ func (e *TopNExec) executeTopN(ctx context.Context) error {
 		// The number of rows we loaded may exceeds total limit, remove greatest rows by Pop.
 		heap.Pop(e.chkHeap)
 	}
-	childRowChk := e.children[0].newFirstChunk()
+	childRowChk := newFirstChunk(e.children[0])
 	for {
-		err := e.children[0].Next(ctx, chunk.NewRecordBatch(childRowChk))
+		err := Next(ctx, e.children[0], childRowChk)
 		if err != nil {
 			return err
 		}
@@ -349,7 +488,7 @@ func (e *TopNExec) processChildChk(childRowChk *chunk.Chunk) error {
 // but we want descending top N, then we will keep all data in memory.
 // But if data is distributed randomly, this function will be called log(n) times.
 func (e *TopNExec) doCompaction() error {
-	newRowChunks := chunk.NewList(e.retTypes(), e.initCap, e.maxChunkSize)
+	newRowChunks := chunk.NewList(retTypes(e), e.initCap, e.maxChunkSize)
 	newRowPtrs := make([]chunk.RowPtr, 0, e.rowChunks.Len())
 	for _, rowPtr := range e.rowPtrs {
 		newRowPtr := newRowChunks.AppendRow(e.rowChunks.GetRow(rowPtr))

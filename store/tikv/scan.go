@@ -29,16 +29,17 @@ import (
 type Scanner struct {
 	snapshot     *tikvSnapshot
 	batchSize    int
-	valid        bool
 	cache        []*pb.KvPair
 	idx          int
-	nextStartKey []byte
-	endKey       []byte
-	eof          bool
+	nextStartKey kv.Key
+	endKey       kv.Key
 
 	// Use for reverse scan.
+	nextEndKey kv.Key
 	reverse    bool
-	nextEndKey []byte
+
+	valid bool
+	eof   bool
 }
 
 func newScanner(snapshot *tikvSnapshot, startKey []byte, endKey []byte, batchSize int, reverse bool) (*Scanner, error) {
@@ -85,7 +86,7 @@ func (s *Scanner) Value() []byte {
 
 // Next return next element.
 func (s *Scanner) Next() error {
-	bo := NewBackoffer(context.WithValue(context.Background(), txnStartKey, s.snapshot.version.Ver), scannerNextMaxBackoff)
+	bo := NewBackofferWithVars(context.WithValue(context.Background(), txnStartKey, s.snapshot.version.Ver), scannerNextMaxBackoff, s.snapshot.vars)
 	if !s.valid {
 		return errors.New("scanner iterator is invalid")
 	}
@@ -108,8 +109,8 @@ func (s *Scanner) Next() error {
 		}
 
 		current := s.cache[s.idx]
-		if (!s.reverse && (len(s.endKey) > 0 && kv.Key(current.Key).Cmp(kv.Key(s.endKey)) >= 0)) ||
-			(s.reverse && len(s.nextStartKey) > 0 && kv.Key(current.Key).Cmp(kv.Key(s.nextStartKey)) < 0) {
+		if (!s.reverse && (len(s.endKey) > 0 && kv.Key(current.Key).Cmp(s.endKey) >= 0)) ||
+			(s.reverse && len(s.nextStartKey) > 0 && kv.Key(current.Key).Cmp(s.nextStartKey) < 0) {
 			s.eof = true
 			s.Close()
 			return nil
@@ -143,7 +144,7 @@ func (s *Scanner) startTS() uint64 {
 }
 
 func (s *Scanner) resolveCurrentLock(bo *Backoffer, current *pb.KvPair) error {
-	val, err := s.snapshot.get(bo, kv.Key(current.Key))
+	val, err := s.snapshot.get(bo, current.Key)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -153,9 +154,9 @@ func (s *Scanner) resolveCurrentLock(bo *Backoffer, current *pb.KvPair) error {
 }
 
 func (s *Scanner) getData(bo *Backoffer) error {
-	logutil.Logger(context.Background()).Debug("txn getData",
-		zap.Binary("nextStartKey", s.nextStartKey),
-		zap.Binary("nextEndKey", s.nextEndKey),
+	logutil.BgLogger().Debug("txn getData",
+		zap.Stringer("nextStartKey", s.nextStartKey),
+		zap.Stringer("nextEndKey", s.nextEndKey),
 		zap.Bool("reverse", s.reverse),
 		zap.Uint64("txnStartTS", s.startTS()))
 	sender := NewRegionRequestSender(s.snapshot.store.regionCache, s.snapshot.store.client)
@@ -185,25 +186,23 @@ func (s *Scanner) getData(bo *Backoffer) error {
 			}
 		}
 
-		req := &tikvrpc.Request{
-			Type: tikvrpc.CmdScan,
-			Scan: &pb.ScanRequest{
-				StartKey: s.nextStartKey,
-				EndKey:   reqEndKey,
-				Limit:    uint32(s.batchSize),
-				Version:  s.startTS(),
-				KeyOnly:  s.snapshot.keyOnly,
-			},
-			Context: pb.Context{
-				Priority:     s.snapshot.priority,
-				NotFillCache: s.snapshot.notFillCache,
-			},
+		sreq := &pb.ScanRequest{
+			StartKey: s.nextStartKey,
+			EndKey:   reqEndKey,
+			Limit:    uint32(s.batchSize),
+			Version:  s.startTS(),
+			KeyOnly:  s.snapshot.keyOnly,
 		}
 		if s.reverse {
-			req.Scan.StartKey = s.nextEndKey
-			req.Scan.EndKey = reqStartKey
-			req.Scan.Reverse = true
+			sreq.StartKey = s.nextEndKey
+			sreq.EndKey = reqStartKey
+			sreq.Reverse = true
 		}
+		req := tikvrpc.NewReplicaReadRequest(tikvrpc.CmdScan, sreq, s.snapshot.replicaRead, &s.snapshot.replicaReadSeed, pb.Context{
+			Priority:     s.snapshot.priority,
+			NotFillCache: s.snapshot.notFillCache,
+			TaskId:       s.snapshot.taskID,
+		})
 		resp, err := sender.SendReq(bo, req, loc.Region, ReadTimeoutMedium)
 		if err != nil {
 			return errors.Trace(err)
@@ -213,7 +212,7 @@ func (s *Scanner) getData(bo *Backoffer) error {
 			return errors.Trace(err)
 		}
 		if regionErr != nil {
-			logutil.Logger(context.Background()).Debug("scanner getData failed",
+			logutil.BgLogger().Debug("scanner getData failed",
 				zap.Stringer("regionErr", regionErr))
 			err = bo.Backoff(BoRegionMiss, errors.New(regionErr.String()))
 			if err != nil {
@@ -221,10 +220,10 @@ func (s *Scanner) getData(bo *Backoffer) error {
 			}
 			continue
 		}
-		cmdScanResp := resp.Scan
-		if cmdScanResp == nil {
+		if resp.Resp == nil {
 			return errors.Trace(ErrBodyMissing)
 		}
+		cmdScanResp := resp.Resp.(*pb.ScanResponse)
 
 		err = s.snapshot.store.CheckVisibility(s.startTS())
 		if err != nil {
@@ -252,8 +251,8 @@ func (s *Scanner) getData(bo *Backoffer) error {
 			} else {
 				s.nextEndKey = reqStartKey
 			}
-			if (!s.reverse && (len(loc.EndKey) == 0 || (len(s.endKey) > 0 && kv.Key(s.nextStartKey).Cmp(kv.Key(s.endKey)) >= 0))) ||
-				(s.reverse && (len(loc.StartKey) == 0 || (len(s.nextStartKey) > 0 && kv.Key(s.nextStartKey).Cmp(kv.Key(s.nextEndKey)) >= 0))) {
+			if (!s.reverse && (len(loc.EndKey) == 0 || (len(s.endKey) > 0 && s.nextStartKey.Cmp(s.endKey) >= 0))) ||
+				(s.reverse && (len(loc.StartKey) == 0 || (len(s.nextStartKey) > 0 && s.nextStartKey.Cmp(s.nextEndKey) >= 0))) {
 				// Current Region is the last one.
 				s.eof = true
 			}
@@ -267,7 +266,7 @@ func (s *Scanner) getData(bo *Backoffer) error {
 		if !s.reverse {
 			s.nextStartKey = kv.Key(lastKey).Next()
 		} else {
-			s.nextEndKey = kv.Key(lastKey)
+			s.nextEndKey = lastKey
 		}
 		return nil
 	}

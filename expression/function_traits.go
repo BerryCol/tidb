@@ -25,6 +25,7 @@ var UnCacheableFunctions = map[string]struct{}{
 	ast.User:         {},
 	ast.ConnectionID: {},
 	ast.LastInsertId: {},
+	ast.RowCount:     {},
 	ast.Version:      {},
 	ast.Like:         {},
 }
@@ -43,6 +44,9 @@ var unFoldableFunctions = map[string]struct{}{
 	ast.GetParam:  {},
 	ast.Benchmark: {},
 	ast.DayName:   {},
+	ast.NextVal:   {},
+	ast.LastVal:   {},
+	ast.SetVal:    {},
 }
 
 // DisableFoldFunctions stores functions which prevent child scope functions from being constant folded.
@@ -87,28 +91,32 @@ var IllegalFunctions4GeneratedColumns = map[string]struct{}{
 	ast.Schema:           {},
 	ast.SessionUser:      {},
 	ast.Sleep:            {},
+	ast.Sysdate:          {},
 	ast.SystemUser:       {},
 	ast.User:             {},
 	ast.Values:           {},
 	ast.Encrypt:          {},
 	ast.Version:          {},
+	ast.JSONMerge:        {},
+	ast.SetVar:           {},
+	ast.GetVar:           {},
+	ast.ReleaseAllLocks:  {},
 }
 
-// DeferredFunctions stores non-deterministic functions, which can be deferred only when the plan cache is enabled.
+// DeferredFunctions stores functions which are foldable but should be deferred as well when plan cache is enabled.
+// Note that, these functions must be foldable at first place, i.e, they are not in `unFoldableFunctions`.
 var DeferredFunctions = map[string]struct{}{
 	ast.Now:              {},
+	ast.RandomBytes:      {},
 	ast.CurrentTimestamp: {},
 	ast.UTCTime:          {},
 	ast.Curtime:          {},
 	ast.CurrentTime:      {},
 	ast.UTCTimestamp:     {},
 	ast.UnixTimestamp:    {},
-	ast.Sysdate:          {},
 	ast.Curdate:          {},
 	ast.CurrentDate:      {},
 	ast.UTCDate:          {},
-	ast.Rand:             {},
-	ast.UUID:             {},
 }
 
 // inequalFunctions stores functions which cannot be propagated from column equal condition.
@@ -155,4 +163,12 @@ var mutableEffectsFunctions = map[string]struct{}{
 	ast.SetVar:      {},
 	ast.GetVar:      {},
 	ast.AnyValue:    {},
+}
+
+// some functions like "get_lock" and "release_lock" currently do NOT have
+// right implementations, but may have noop ones(like with any inputs, always return 1)
+// if apps really need these "funcs" to run, we offer sys var(tidb_enable_noop_functions) to enable noop usage
+var noopFuncs = map[string]struct{}{
+	ast.GetLock:     {},
+	ast.ReleaseLock: {},
 }

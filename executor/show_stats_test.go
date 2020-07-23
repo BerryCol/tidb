@@ -14,12 +14,19 @@
 package executor_test
 
 import (
+	"fmt"
+	"time"
+
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/util/testkit"
 )
 
-func (s *testSuite1) TestShowStatsMeta(c *C) {
+type testShowStatsSuite struct {
+	*baseTestSuite
+}
+
+func (s *testShowStatsSuite) TestShowStatsMeta(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists t, t1")
@@ -35,7 +42,7 @@ func (s *testSuite1) TestShowStatsMeta(c *C) {
 	c.Assert(result.Rows()[0][1], Equals, "t")
 }
 
-func (s *testSuite1) TestShowStatsHistograms(c *C) {
+func (s *testShowStatsSuite) TestShowStatsHistograms(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists t")
@@ -63,7 +70,7 @@ func (s *testSuite1) TestShowStatsHistograms(c *C) {
 	c.Assert(len(res.Rows()), Equals, 1)
 }
 
-func (s *testSuite1) TestShowStatsBuckets(c *C) {
+func (s *testShowStatsSuite) TestShowStatsBuckets(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists t")
@@ -77,9 +84,10 @@ func (s *testSuite1) TestShowStatsBuckets(c *C) {
 	result.Check(testkit.Rows("test t  idx 1 0 1 1 (1, 1) (1, 1)"))
 }
 
-func (s *testSuite1) TestShowStatsHasNullValue(c *C) {
+func (s *testShowStatsSuite) TestShowStatsHasNullValue(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
 	tk.MustExec("create table t (a int, index idx(a))")
 	tk.MustExec("insert into t values(NULL)")
 	tk.MustExec("analyze table t")
@@ -137,7 +145,7 @@ func (s *testSuite1) TestShowStatsHasNullValue(c *C) {
 	c.Assert(res.Rows()[4][7], Equals, "0")
 }
 
-func (s *testSuite1) TestShowPartitionStats(c *C) {
+func (s *testShowStatsSuite) TestShowPartitionStats(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("set @@session.tidb_enable_table_partition=1")
 	tk.MustExec("use test")
@@ -170,7 +178,7 @@ func (s *testSuite1) TestShowPartitionStats(c *C) {
 	result.Check(testkit.Rows("test t p0 100"))
 }
 
-func (s *testSuite1) TestShowAnalyzeStatus(c *C) {
+func (s *testShowStatsSuite) TestShowAnalyzeStatus(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	statistics.ClearHistoryJobs()
 	tk.MustExec("use test")
@@ -197,4 +205,29 @@ func (s *testSuite1) TestShowAnalyzeStatus(c *C) {
 	c.Assert(result.Rows()[1][4], Equals, "2")
 	c.Assert(result.Rows()[1][5], NotNil)
 	c.Assert(result.Rows()[1][6], Equals, "finished")
+}
+
+func (s *testShowStatsSuite) TestShowStatusSnapshot(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("drop database if exists test;")
+	tk.MustExec("create database test;")
+	tk.MustExec("use test;")
+	tk.MustExec("create table t (a int);")
+
+	// For mocktikv, safe point is not initialized, we manually insert it for snapshot to use.
+	safePointName := "tikv_gc_safe_point"
+	safePointValue := "20060102-15:04:05 -0700"
+	safePointComment := "All versions after safe point can be accessed. (DO NOT EDIT)"
+	updateSafePoint := fmt.Sprintf(`INSERT INTO mysql.tidb VALUES ('%[1]s', '%[2]s', '%[3]s')
+	ON DUPLICATE KEY
+	UPDATE variable_value = '%[2]s', comment = '%[3]s'`, safePointName, safePointValue, safePointComment)
+	tk.MustExec(updateSafePoint)
+
+	snapshotTime := time.Now()
+
+	tk.MustExec("drop table t;")
+	tk.MustQuery("show table status;").Check(testkit.Rows())
+	tk.MustExec("set @@tidb_snapshot = '" + snapshotTime.Format("2006-01-02 15:04:05.999999") + "'")
+	result := tk.MustQuery("show table status;")
+	c.Check(result.Rows()[0][0], Matches, "t")
 }

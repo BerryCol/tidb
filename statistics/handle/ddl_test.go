@@ -68,7 +68,7 @@ func (s *testStatsSuite) TestDDLTable(c *C) {
 	h := do.StatsHandle()
 	err = h.HandleDDLEvent(<-h.DDLEventCh())
 	c.Assert(err, IsNil)
-	h.Update(is)
+	c.Assert(h.Update(is), IsNil)
 	statsTbl := h.GetTableStats(tableInfo)
 	c.Assert(statsTbl.Pseudo, IsFalse)
 
@@ -79,7 +79,7 @@ func (s *testStatsSuite) TestDDLTable(c *C) {
 	tableInfo = tbl.Meta()
 	err = h.HandleDDLEvent(<-h.DDLEventCh())
 	c.Assert(err, IsNil)
-	h.Update(is)
+	c.Assert(h.Update(is), IsNil)
 	statsTbl = h.GetTableStats(tableInfo)
 	c.Assert(statsTbl.Pseudo, IsFalse)
 
@@ -90,7 +90,7 @@ func (s *testStatsSuite) TestDDLTable(c *C) {
 	tableInfo = tbl.Meta()
 	err = h.HandleDDLEvent(<-h.DDLEventCh())
 	c.Assert(err, IsNil)
-	h.Update(is)
+	c.Assert(h.Update(is), IsNil)
 	statsTbl = h.GetTableStats(tableInfo)
 	c.Assert(statsTbl.Pseudo, IsFalse)
 }
@@ -111,7 +111,7 @@ func (s *testStatsSuite) TestDDLHistogram(c *C) {
 	err := h.HandleDDLEvent(<-h.DDLEventCh())
 	c.Assert(err, IsNil)
 	is := do.InfoSchema()
-	h.Update(is)
+	c.Assert(h.Update(is), IsNil)
 	tbl, err := is.TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
 	c.Assert(err, IsNil)
 	tableInfo := tbl.Meta()
@@ -124,7 +124,7 @@ func (s *testStatsSuite) TestDDLHistogram(c *C) {
 	err = h.HandleDDLEvent(<-h.DDLEventCh())
 	c.Assert(err, IsNil)
 	is = do.InfoSchema()
-	h.Update(is)
+	c.Assert(h.Update(is), IsNil)
 	tbl, err = is.TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
 	c.Assert(err, IsNil)
 	tableInfo = tbl.Meta()
@@ -142,7 +142,7 @@ func (s *testStatsSuite) TestDDLHistogram(c *C) {
 	err = h.HandleDDLEvent(<-h.DDLEventCh())
 	c.Assert(err, IsNil)
 	is = do.InfoSchema()
-	h.Update(is)
+	c.Assert(h.Update(is), IsNil)
 	tbl, err = is.TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
 	c.Assert(err, IsNil)
 	tableInfo = tbl.Meta()
@@ -154,13 +154,24 @@ func (s *testStatsSuite) TestDDLHistogram(c *C) {
 	err = h.HandleDDLEvent(<-h.DDLEventCh())
 	c.Assert(err, IsNil)
 	is = do.InfoSchema()
-	h.Update(is)
+	c.Assert(h.Update(is), IsNil)
 	tbl, err = is.TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
 	c.Assert(err, IsNil)
 	tableInfo = tbl.Meta()
 	statsTbl = do.StatsHandle().GetTableStats(tableInfo)
 	c.Assert(statsTbl.Pseudo, IsFalse)
-	c.Check(statsTbl.Columns[tableInfo.Columns[5].ID].AvgColSize(statsTbl.Count), Equals, 3.0)
+	c.Check(statsTbl.Columns[tableInfo.Columns[5].ID].AvgColSize(statsTbl.Count, false), Equals, 3.0)
+
+	testKit.MustExec("alter table t add column c6 varchar(15) DEFAULT '123', add column c7 varchar(15) DEFAULT '123'")
+	err = h.HandleDDLEvent(<-h.DDLEventCh())
+	c.Assert(err, IsNil)
+	is = do.InfoSchema()
+	c.Assert(h.Update(is), IsNil)
+	tbl, err = is.TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
+	c.Assert(err, IsNil)
+	tableInfo = tbl.Meta()
+	statsTbl = do.StatsHandle().GetTableStats(tableInfo)
+	c.Assert(statsTbl.Pseudo, IsFalse)
 
 	testKit.MustExec("create index i on t(c2, c1)")
 	testKit.MustExec("analyze table t")
@@ -191,7 +202,7 @@ PARTITION BY RANGE ( a ) (
 	h := do.StatsHandle()
 	err = h.HandleDDLEvent(<-h.DDLEventCh())
 	c.Assert(err, IsNil)
-	h.Update(is)
+	c.Assert(h.Update(is), IsNil)
 	pi := tableInfo.GetPartitionInfo()
 	for _, def := range pi.Definitions {
 		statsTbl := h.GetPartitionStats(tableInfo, def.ID)
@@ -204,7 +215,7 @@ PARTITION BY RANGE ( a ) (
 	err = h.HandleDDLEvent(<-h.DDLEventCh())
 	c.Assert(err, IsNil)
 	is = do.InfoSchema()
-	h.Update(is)
+	c.Assert(h.Update(is), IsNil)
 	tbl, err = is.TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
 	c.Assert(err, IsNil)
 	tableInfo = tbl.Meta()
@@ -212,6 +223,36 @@ PARTITION BY RANGE ( a ) (
 	for _, def := range pi.Definitions {
 		statsTbl := h.GetPartitionStats(tableInfo, def.ID)
 		c.Assert(statsTbl.Pseudo, IsFalse)
-		c.Check(statsTbl.Columns[tableInfo.Columns[2].ID].AvgColSize(statsTbl.Count), Equals, 3.0)
+		c.Check(statsTbl.Columns[tableInfo.Columns[2].ID].AvgColSize(statsTbl.Count, false), Equals, 3.0)
+	}
+
+	addPartition := "alter table t add partition (partition p4 values less than (26))"
+	testKit.MustExec(addPartition)
+	is = s.do.InfoSchema()
+	tbl, err = is.TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
+	c.Assert(err, IsNil)
+	tableInfo = tbl.Meta()
+	err = h.HandleDDLEvent(<-h.DDLEventCh())
+	c.Assert(err, IsNil)
+	c.Assert(h.Update(is), IsNil)
+	pi = tableInfo.GetPartitionInfo()
+	for _, def := range pi.Definitions {
+		statsTbl := h.GetPartitionStats(tableInfo, def.ID)
+		c.Assert(statsTbl.Pseudo, IsFalse)
+	}
+
+	truncatePartition := "alter table t truncate partition p4"
+	testKit.MustExec(truncatePartition)
+	is = s.do.InfoSchema()
+	tbl, err = is.TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
+	c.Assert(err, IsNil)
+	tableInfo = tbl.Meta()
+	err = h.HandleDDLEvent(<-h.DDLEventCh())
+	c.Assert(err, IsNil)
+	c.Assert(h.Update(is), IsNil)
+	pi = tableInfo.GetPartitionInfo()
+	for _, def := range pi.Definitions {
+		statsTbl := h.GetPartitionStats(tableInfo, def.ID)
+		c.Assert(statsTbl.Pseudo, IsFalse)
 	}
 }

@@ -23,6 +23,7 @@ import (
 	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/infoschema"
+	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/sessionctx"
@@ -53,11 +54,11 @@ func (s *testValidatorSuite) TestValidator(c *C) {
 		{"create table t(id int auto_increment default null, primary key (id))", true, nil},
 		{"create table t(id int default null auto_increment, primary key (id))", true, nil},
 		{"create table t(id int not null auto_increment)", true,
-			errors.New("Incorrect table definition; there can be only one auto column and it must be defined as a key")},
+			errors.New("[autoid:1075]Incorrect table definition; there can be only one auto column and it must be defined as a key")},
 		{"create table t(id int not null auto_increment, c int auto_increment, key (id, c))", true,
-			errors.New("Incorrect table definition; there can be only one auto column and it must be defined as a key")},
+			errors.New("[autoid:1075]Incorrect table definition; there can be only one auto column and it must be defined as a key")},
 		{"create table t(id int not null auto_increment, c int, key (c, id))", true,
-			errors.New("Incorrect table definition; there can be only one auto column and it must be defined as a key")},
+			errors.New("[autoid:1075]Incorrect table definition; there can be only one auto column and it must be defined as a key")},
 		{"create table t(id decimal auto_increment, key (id))", true,
 			errors.New("Incorrect column specifier for column 'id'")},
 		{"create table t(id float auto_increment, key (id))", true, nil},
@@ -201,11 +202,22 @@ func (s *testValidatorSuite) TestValidator(c *C) {
 		{"select * from (select 1 ) a , (select 2) b, (select * from (select 3) a join (select 4) b) c;", false, nil},
 
 		{"CREATE VIEW V (a,b,c) AS SELECT 1,1,3;", false, nil},
+		{"CREATE VIEW V AS SELECT 5 INTO OUTFILE 'ttt'", true, ddl.ErrViewSelectClause.GenWithStackByArgs("INFO")},
+		{"CREATE VIEW V AS SELECT 5 FOR UPDATE", false, nil},
+		{"CREATE VIEW V AS SELECT 5 LOCK IN SHARE MODE", false, nil},
 
 		// issue 9464
 		{"CREATE TABLE t1 (id INT NOT NULL, c1 VARCHAR(20) AS ('foo') VIRTUAL KEY NULL, PRIMARY KEY (id));", false, core.ErrUnsupportedOnGeneratedColumn},
 		{"CREATE TABLE t1 (id INT NOT NULL, c1 VARCHAR(20) AS ('foo') VIRTUAL KEY NOT NULL, PRIMARY KEY (id));", false, core.ErrUnsupportedOnGeneratedColumn},
 		{"create table t (a DOUBLE NULL, b_sto DOUBLE GENERATED ALWAYS AS (a + 2) STORED UNIQUE KEY NOT NULL PRIMARY KEY);", false, nil},
+
+		// issue 13032
+		{"CREATE TABLE origin (a int primary key, b varchar(10), c int auto_increment);", false, autoid.ErrWrongAutoKey},
+		{"CREATE TABLE origin (a int auto_increment, b int key);", false, autoid.ErrWrongAutoKey},
+		{"CREATE TABLE origin (a int auto_increment, b int unique);", false, autoid.ErrWrongAutoKey},
+		{"CREATE TABLE origin (a int primary key auto_increment, b int);", false, nil},
+		{"CREATE TABLE origin (a int unique auto_increment, b int);", false, nil},
+		{"CREATE TABLE origin (a int key auto_increment, b int);", false, nil},
 	}
 
 	store, dom, err := newStoreWithBootstrap()
@@ -219,7 +231,7 @@ func (s *testValidatorSuite) TestValidator(c *C) {
 	_, err = se.Execute(context.Background(), "use test")
 	c.Assert(err, IsNil)
 	ctx := se.(sessionctx.Context)
-	is := infoschema.MockInfoSchema([]*model.TableInfo{core.MockTable()})
+	is := infoschema.MockInfoSchema([]*model.TableInfo{core.MockSignedTable()})
 	for _, tt := range tests {
 		stmts, err1 := session.Parse(ctx, tt.sql)
 		c.Assert(err1, IsNil)

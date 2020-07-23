@@ -19,11 +19,10 @@ package session
 
 import (
 	"context"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/opentracing/opentracing-go"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser"
 	"github.com/pingcap/parser/ast"
@@ -31,6 +30,7 @@ import (
 	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/domain"
+	"github.com/pingcap/tidb/errno"
 	"github.com/pingcap/tidb/executor"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/sessionctx"
@@ -64,12 +64,10 @@ func (dm *domainMap) Get(store kv.Storage) (d *domain.Domain, err error) {
 		return
 	}
 
-	ddlLease := time.Duration(0)
-	statisticLease := time.Duration(0)
-	ddlLease = schemaLease
-	statisticLease = statsLease
+	ddlLease := time.Duration(atomic.LoadInt64(&schemaLease))
+	statisticLease := time.Duration(atomic.LoadInt64(&statsLease))
 	err = util.RunWithRetry(util.DefaultMaxRetries, util.RetryInterval, func() (retry bool, err1 error) {
-		logutil.Logger(context.Background()).Info("new domain",
+		logutil.BgLogger().Info("new domain",
 			zap.String("store", store.UUID()),
 			zap.Stringer("ddl lease", ddlLease),
 			zap.Stringer("stats lease", statisticLease))
@@ -80,7 +78,7 @@ func (dm *domainMap) Get(store kv.Storage) (d *domain.Domain, err error) {
 		if err1 != nil {
 			// If we don't clean it, there are some dirty data when retrying the function of Init.
 			d.Close()
-			logutil.Logger(context.Background()).Error("[ddl] init domain failed",
+			logutil.BgLogger().Error("[ddl] init domain failed",
 				zap.Error(err1))
 		}
 		return true, err1
@@ -113,27 +111,53 @@ var (
 	// Default schema lease time is 1 second, you can change it with a proper time,
 	// but you must know that too little may cause badly performance degradation.
 	// For production, you should set a big schema lease, like 300s+.
-	schemaLease = 1 * time.Second
+	schemaLease = int64(1 * time.Second)
 
 	// statsLease is the time for reload stats table.
-	statsLease = 3 * time.Second
+	statsLease = int64(3 * time.Second)
 )
+
+// ResetStoreForWithTiKVTest is only used in the test code.
+// TODO: Remove domap and storeBootstrapped. Use store.SetOption() to do it.
+func ResetStoreForWithTiKVTest(store kv.Storage) {
+	domap.Delete(store)
+	unsetStoreBootstrapped(store.UUID())
+}
+
+func setStoreBootstrapped(storeUUID string) {
+	storeBootstrappedLock.Lock()
+	defer storeBootstrappedLock.Unlock()
+	storeBootstrapped[storeUUID] = true
+}
+
+// unsetStoreBootstrapped delete store uuid from stored bootstrapped map.
+// currently this function only used for test.
+func unsetStoreBootstrapped(storeUUID string) {
+	storeBootstrappedLock.Lock()
+	defer storeBootstrappedLock.Unlock()
+	delete(storeBootstrapped, storeUUID)
+}
 
 // SetSchemaLease changes the default schema lease time for DDL.
 // This function is very dangerous, don't use it if you really know what you do.
 // SetSchemaLease only affects not local storage after bootstrapped.
 func SetSchemaLease(lease time.Duration) {
-	schemaLease = lease
+	atomic.StoreInt64(&schemaLease, int64(lease))
 }
 
 // SetStatsLease changes the default stats lease time for loading stats info.
 func SetStatsLease(lease time.Duration) {
-	statsLease = lease
+	atomic.StoreInt64(&statsLease, int64(lease))
+}
+
+// DisableStats4Test disables the stats for tests.
+func DisableStats4Test() {
+	SetStatsLease(-1)
 }
 
 // Parse parses a query string to raw ast.StmtNode.
 func Parse(ctx sessionctx.Context, src string) ([]ast.StmtNode, error) {
-	logutil.Logger(context.Background()).Debug("compiling", zap.String("source", src))
+	logutil.BgLogger().Debug("compiling", zap.String("source", src))
 	charset, collation := ctx.GetSessionVars().GetCharsetInfo()
 	p := parser.New()
 	p.EnableWindowFunc(ctx.GetSessionVars().EnableWindowFunction)
@@ -143,7 +167,7 @@ func Parse(ctx sessionctx.Context, src string) ([]ast.StmtNode, error) {
 		ctx.GetSessionVars().StmtCtx.AppendWarning(warn)
 	}
 	if err != nil {
-		logutil.Logger(context.Background()).Warn("compiling",
+		logutil.BgLogger().Warn("compiling",
 			zap.String("source", src),
 			zap.Error(err))
 		return nil, err
@@ -158,89 +182,17 @@ func Compile(ctx context.Context, sctx sessionctx.Context, stmtNode ast.StmtNode
 	return stmt, err
 }
 
-func finishStmt(ctx context.Context, sctx sessionctx.Context, se *session, sessVars *variable.SessionVars, meetsErr error) error {
-	if meetsErr != nil {
-		if !sessVars.InTxn() {
-			logutil.Logger(context.Background()).Info("rollbackTxn for ddl/autocommit error.")
-			se.RollbackTxn(ctx)
-		} else if se.txn.Valid() && se.txn.IsPessimistic() && strings.Contains(meetsErr.Error(), "deadlock") {
-			logutil.Logger(context.Background()).Info("rollbackTxn for deadlock error", zap.Uint64("txn", se.txn.StartTS()))
-			meetsErr = errDeadlock
-			se.RollbackTxn(ctx)
-		}
-		return meetsErr
+func recordAbortTxnDuration(sessVars *variable.SessionVars) {
+	duration := time.Since(sessVars.TxnCtx.CreateTime).Seconds()
+	if sessVars.TxnCtx.IsPessimistic {
+		transactionDurationPessimisticAbort.Observe(duration)
+	} else {
+		transactionDurationOptimisticAbort.Observe(duration)
 	}
-
-	if !sessVars.InTxn() {
-		return se.CommitTxn(ctx)
-	}
-
-	return checkStmtLimit(ctx, sctx, se, sessVars)
 }
 
-func checkStmtLimit(ctx context.Context, sctx sessionctx.Context, se *session, sessVars *variable.SessionVars) error {
-	// If the user insert, insert, insert ... but never commit, TiDB would OOM.
-	// So we limit the statement count in a transaction here.
-	var err error
-	history := GetHistory(sctx)
-	if history.Count() > int(config.GetGlobalConfig().Performance.StmtCountLimit) {
-		if !sessVars.BatchCommit {
-			se.RollbackTxn(ctx)
-			return errors.Errorf("statement count %d exceeds the transaction limitation, autocommit = %t",
-				history.Count(), sctx.GetSessionVars().IsAutocommit())
-		}
-		err = se.NewTxn(ctx)
-		// The transaction does not committed yet, we need to keep it in transaction.
-		// The last history could not be "commit"/"rollback" statement.
-		// It means it is impossible to start a new transaction at the end of the transaction.
-		// Because after the server executed "commit"/"rollback" statement, the session is out of the transaction.
-		se.sessionVars.SetStatusFlag(mysql.ServerStatusInTrans, true)
-	}
-	return err
-}
-
-// runStmt executes the sqlexec.Statement and commit or rollback the current transaction.
-func runStmt(ctx context.Context, sctx sessionctx.Context, s sqlexec.Statement) (rs sqlexec.RecordSet, err error) {
-	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
-		span1 := span.Tracer().StartSpan("session.runStmt", opentracing.ChildOf(span.Context()))
-		span1.LogKV("sql", s.OriginText())
-		defer span1.Finish()
-	}
-	se := sctx.(*session)
-	defer func() {
-		// If it is not a select statement, we record its slow log here,
-		// then it could include the transaction commit time.
-		if rs == nil {
-			s.(*executor.ExecStmt).LogSlowQuery(se.GetSessionVars().TxnCtx.StartTS, err != nil)
-		}
-	}()
-
-	err = se.checkTxnAborted(s)
-	if err != nil {
-		return nil, err
-	}
-	rs, err = s.Exec(ctx)
-	sessVars := se.GetSessionVars()
-	// All the history should be added here.
-	sessVars.TxnCtx.StatementCount++
-	if !s.IsReadOnly(sessVars) {
-		if err == nil {
-			GetHistory(sctx).Add(0, s, se.sessionVars.StmtCtx)
-		}
-		if txn, err1 := sctx.Txn(false); err1 == nil {
-			if txn.Valid() {
-				if err != nil {
-					sctx.StmtRollback()
-				} else {
-					err = sctx.StmtCommit()
-				}
-			}
-		} else {
-			logutil.Logger(context.Background()).Error("get txn error", zap.Error(err1))
-		}
-	}
-
-	err = finishStmt(ctx, sctx, se, sessVars, err)
+func finishStmt(ctx context.Context, se *session, meetsErr error, sql sqlexec.Statement) error {
+	err := autoCommitAfterStmt(ctx, se, meetsErr, sql)
 	if se.txn.pending() {
 		// After run statement finish, txn state is still pending means the
 		// statement never need a Txn(), such as:
@@ -252,7 +204,59 @@ func runStmt(ctx context.Context, sctx sessionctx.Context, s sqlexec.Statement) 
 		// Reset txn state to invalid to dispose the pending start ts.
 		se.txn.changeToInvalid()
 	}
-	return rs, err
+	if err != nil {
+		return err
+	}
+	return checkStmtLimit(ctx, se)
+}
+
+func autoCommitAfterStmt(ctx context.Context, se *session, meetsErr error, sql sqlexec.Statement) error {
+	sessVars := se.sessionVars
+	if meetsErr != nil {
+		if !sessVars.InTxn() {
+			logutil.BgLogger().Info("rollbackTxn for ddl/autocommit failed")
+			se.RollbackTxn(ctx)
+			recordAbortTxnDuration(sessVars)
+		} else if se.txn.Valid() && se.txn.IsPessimistic() && executor.ErrDeadlock.Equal(meetsErr) {
+			logutil.BgLogger().Info("rollbackTxn for deadlock", zap.Uint64("txn", se.txn.StartTS()))
+			se.RollbackTxn(ctx)
+			recordAbortTxnDuration(sessVars)
+		}
+		return meetsErr
+	}
+
+	if !sessVars.InTxn() {
+		if err := se.CommitTxn(ctx); err != nil {
+			if _, ok := sql.(*executor.ExecStmt).StmtNode.(*ast.CommitStmt); ok {
+				err = errors.Annotatef(err, "previous statement: %s", se.GetSessionVars().PrevStmt)
+			}
+			return err
+		}
+		return nil
+	}
+	return nil
+}
+
+func checkStmtLimit(ctx context.Context, se *session) error {
+	// If the user insert, insert, insert ... but never commit, TiDB would OOM.
+	// So we limit the statement count in a transaction here.
+	var err error
+	sessVars := se.GetSessionVars()
+	history := GetHistory(se)
+	if history.Count() > int(config.GetGlobalConfig().Performance.StmtCountLimit) {
+		if !sessVars.BatchCommit {
+			se.RollbackTxn(ctx)
+			return errors.Errorf("statement count %d exceeds the transaction limitation, autocommit = %t",
+				history.Count(), sessVars.IsAutocommit())
+		}
+		err = se.NewTxn(ctx)
+		// The transaction does not committed yet, we need to keep it in transaction.
+		// The last history could not be "commit"/"rollback" statement.
+		// It means it is impossible to start a new transaction at the end of the transaction.
+		// Because after the server executed "commit"/"rollback" statement, the session is out of the transaction.
+		sessVars.SetStatusFlag(mysql.ServerStatusInTrans, true)
+	}
+	return err
 }
 
 // GetHistory get all stmtHistory in current txn. Exported only for test.
@@ -272,11 +276,9 @@ func GetRows4Test(ctx context.Context, sctx sessionctx.Context, rs sqlexec.Recor
 		return nil, nil
 	}
 	var rows []chunk.Row
-	req := rs.NewRecordBatch()
+	req := rs.NewChunk()
+	// Must reuse `req` for imitating server.(*clientConn).writeChunks
 	for {
-		// Since we collect all the rows, we can not reuse the chunk.
-		iter := chunk.NewIterator4Chunk(req.Chunk)
-
 		err := rs.Next(ctx, req)
 		if err != nil {
 			return nil, err
@@ -285,61 +287,45 @@ func GetRows4Test(ctx context.Context, sctx sessionctx.Context, rs sqlexec.Recor
 			break
 		}
 
+		iter := chunk.NewIterator4Chunk(req.CopyConstruct())
 		for row := iter.Begin(); row != iter.End(); row = iter.Next() {
 			rows = append(rows, row)
 		}
-		req.Chunk = chunk.Renew(req.Chunk, sctx.GetSessionVars().MaxChunkSize)
 	}
 	return rows, nil
 }
 
-var queryStmtTable = []string{"explain", "select", "show", "execute", "describe", "desc", "admin"}
-
-func trimSQL(sql string) string {
-	// Trim space.
-	sql = strings.TrimSpace(sql)
-	// Trim leading /*comment*/
-	// There may be multiple comments
-	for strings.HasPrefix(sql, "/*") {
-		i := strings.Index(sql, "*/")
-		if i != -1 && i < len(sql)+1 {
-			sql = sql[i+2:]
-			sql = strings.TrimSpace(sql)
-			continue
-		}
-		break
+// ResultSetToStringSlice changes the RecordSet to [][]string.
+func ResultSetToStringSlice(ctx context.Context, s Session, rs sqlexec.RecordSet) ([][]string, error) {
+	rows, err := GetRows4Test(ctx, s, rs)
+	if err != nil {
+		return nil, err
 	}
-	// Trim leading '('. For `(select 1);` is also a query.
-	return strings.TrimLeft(sql, "( ")
+	err = rs.Close()
+	if err != nil {
+		return nil, err
+	}
+	sRows := make([][]string, len(rows))
+	for i := range rows {
+		row := rows[i]
+		iRow := make([]string, row.Len())
+		for j := 0; j < row.Len(); j++ {
+			if row.IsNull(j) {
+				iRow[j] = "<nil>"
+			} else {
+				d := row.GetDatum(j, &rs.Fields()[j].Column.FieldType)
+				iRow[j], err = d.ToString()
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		sRows[i] = iRow
+	}
+	return sRows, nil
 }
 
-// IsQuery checks if a sql statement is a query statement.
-func IsQuery(sql string) bool {
-	sqlText := strings.ToLower(trimSQL(sql))
-	for _, key := range queryStmtTable {
-		if strings.HasPrefix(sqlText, key) {
-			return true
-		}
-	}
-
-	return false
-}
-
+// Session errors.
 var (
-	errForUpdateCantRetry = terror.ClassSession.New(codeForUpdateCantRetry,
-		mysql.MySQLErrName[mysql.ErrForUpdateCantRetry])
-	errDeadlock = terror.ClassSession.New(codeDeadlock, mysql.MySQLErrName[mysql.ErrLockDeadlock])
+	ErrForUpdateCantRetry = terror.ClassSession.New(errno.ErrForUpdateCantRetry, errno.MySQLErrName[errno.ErrForUpdateCantRetry])
 )
-
-const (
-	codeForUpdateCantRetry terror.ErrCode = mysql.ErrForUpdateCantRetry
-	codeDeadlock           terror.ErrCode = mysql.ErrLockDeadlock
-)
-
-func init() {
-	sessionMySQLErrCodes := map[terror.ErrCode]uint16{
-		codeForUpdateCantRetry: mysql.ErrForUpdateCantRetry,
-		codeDeadlock:           mysql.ErrLockDeadlock,
-	}
-	terror.ErrClassToMySQLCodes[terror.ClassSession] = sessionMySQLErrCodes
-}
